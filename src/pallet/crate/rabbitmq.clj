@@ -1,217 +1,247 @@
 (ns pallet.crate.rabbitmq
   (:require
-   [pallet.action.directory :as directory]
-   [pallet.action.exec-script :as exec-script]
-   [pallet.action.package :as package]
-   [pallet.action.remote-file :as remote-file]
-   [pallet.compute :as compute]
+   [clojure.tools.logging :refer [debugf]]
+   [pallet.api :refer [plan-fn] :as api]
+   [pallet.actions :as actions]
+   [pallet.node :as node]
    [pallet.crate.etc-default :as etc-default]
    [pallet.crate.etc-hosts :as etc-hosts]
    [pallet.crate.iptables :as iptables]
-   [pallet.parameter :as parameter]
-   [pallet.session :as session]
-   [clojure.string :as string])
-  (:use
-   pallet.thread-expr))
+   [pallet.crate :refer [defplan assoc-settings get-settings service-phases] :as crate]
+   [pallet.utils :refer [apply-map]]
+   [clojure.string :as string]
+   [pallet.crate.erlang-config :as erlang-config]
+   [pallet.stevedore :refer [fragment]]
+   [pallet.script.lib :refer [file config-root log-root]]
+   [pallet.version-dispatch :refer [defmethod-version-plan
+                                    defmulti-version-plan]]
+   [pallet.crate.service :refer [supervisor-config supervisor-config-map] :as service]
+   [pallet.crate-install :as crate-install]
+   [pallet.crate.nohup]))
 
-(def ^{:doc "Settings for the daemon"}
-  etc-default-keys
-  {:node-count :NODE_COUNT
-   :rotate-suffix :ROTATE_SUFFIX
-   :user :USER
-   :name :NAME
-   :desc :DESC
-   :init-log-dir :INIT_LOG_DIR
-   :daemon :DAEMON})
 
-(def ^{:doc "RabbitMQ conf settings"} conf-keys
-  {:mnesia-base :MNESIA_BASE
-   :log-base :LOG_BASE
-   :nodename :NODENAME
-   :node-ip-addres :NODE_IP_ADDRESS
-   :node-port :NODE_PORT
-   :config-file :CONFIG_FILE
-   :server-start-args :SERVER_START_ARGS
-   :multi-start-args :MULTI_START_ARGS
-   :ctl-erl-args :CTL_ERL_ARGS})
+(def ^{:doc "Flag for recognising changes to configuration"}
+  rabbitmq-config-changed-flag "rabbitmq-config")
 
-(defmulti erlang-config-format class)
-(defmethod erlang-config-format :default
-  [x]
-  (str x))
+;;; # Settings
+(defn service-name
+  "Return a service name for rabbitmq."
+  [{:keys [instance-id] :as options}]
+  (str "rabbitmq" (when instance-id (str "-" instance-id))))
 
-(defmethod erlang-config-format clojure.lang.Named
-  [x]
-  (name x))
+(defn default-settings [options]
+  {:user "rabbitmq"
+   :group "rabbitmq"
+   :owner "rabbitmq"
+   :config-file "/etc/rabbitmq/rabbitmq.config"
+   :env-file "/etc/rabbitmq/rabbitmq-env.conf"
+   :config-dir (fragment (file (config-root) "rabbitmq"))
+   :log-dir (fragment (file (log-root) "rabbitmq"))
+   :supervisor :nohup
+   :nohup {:process-name "rabbitmq-server"}
+   :service-name (service-name options)
+   :node-count 1
+   :env {}
+   :config {:rabbit {}}})
 
-(defmethod erlang-config-format java.lang.String
-  [x]
-  (str "'" x "'"))
+(def ^{:doc "rabbitmq environment settings"} env-keys
+  {:mnesia-base :RABBITMQ_MNESIA_BASE
+   :mnesia-dir :RABBITMQ_MNESIA_DIR
+   :base :RABBITMQ_BASE
+   :log-base :RABBITMQ_LOG_BASE
+   :logs :RABBITMQ_LOGS
+   :sasl-logs :RABBITMQ_SASL_LOGS
+   :plugins-dir :RABBITMQ_PLUGINS_DIR
+   :enabled-plugins-file :RABBITMQ_ENABLED_PLUGINS_FILE
+   :plugins-expand-dir :RABBITMQ_PLUGINS_EXPAND_DIR
+   :nodename :RABBITMQ_NODENAME
+   :node-ip-addres :RABBITMQ_NODE_IP_ADDRESS
+   :node-port :RABBITMQ_NODE_PORT
+   :config-file :RABBITMQ_CONFIG_FILE
+   :server-start-args :RABBITMQ_SERVER_START_ARGS
+   :multi-start-args :RABBITMQ_MULTI_START_ARGS
+   :ctl-erl-args :RABBITMQ_CTL_ERL_ARGS
+   :server-erl-args :RABBITMQ_SERVER_ERL_ARGS})
 
-(defmethod erlang-config-format java.util.Map$Entry
-  [x]
-  (str
-   "{" (erlang-config-format (key x)) ", " (erlang-config-format (val x)) "}"))
+(defn run-command
+  "Return a script command to run rabbitmq."
+  [{:keys [home user config-dir] :as settings}]
+  (fragment (file "rabbitmq-server")))
 
-(defmethod erlang-config-format clojure.lang.ISeq
-  [x]
-  (str "[" (string/join "," (map erlang-config-format x)) "]"))
+;;; At the moment we just have a single implementation of settings,
+;;; but this is open-coded.
+(defmulti-version-plan settings-map [version settings])
 
-(defmethod erlang-config-format clojure.lang.IPersistentMap
-  [x]
-  (str "[" (string/join "," (map erlang-config-format x)) "]"))
+(defmethod-version-plan
+    settings-map {:os :linux}
+    [os os-version version settings]
+  (cond
+   (:install-strategy settings) settings
+   :else  (assoc settings
+            :install-strategy ::packages
+            :packages ["rabbitmq-server"])))
 
-(defn erlang-config [m]
-  (str (erlang-config-format m) "."))
+
+(defmethod supervisor-config-map [:rabbitmq :runit]
+  [_ {:keys [run-command service-name user] :as settings} options]
+  {:service-name service-name
+   :run-file {:content (str "#!/bin/sh\nexec chpst " run-command)}})
+
+(defmethod supervisor-config-map [:rabbitmq :upstart]
+  [_ {:keys [run-command service-name user] :as settings} options]
+  {:service-name service-name
+   :exec run-command
+   :setuid user})
+
+(defmethod supervisor-config-map [:rabbitmq :nohup]
+  [_ {:keys [run-command service-name user] :as settings} options]
+  {:service-name service-name
+   :run-file {:content run-command}
+   :user user})
+
+
+(defplan settings
+  "Settings for rabbitmq"
+  [{:keys [user owner group dist dist-urls version instance-id]
+    :as settings}
+   & {:keys [instance-id] :as options}]
+  (let [settings (merge (default-settings options) settings)
+        settings (settings-map (:version settings) settings)
+        settings (update-in settings [:run-command]
+                            #(or % (run-command settings)))]
+    (assoc-settings :rabbitmq settings {:instance-id instance-id})
+    (supervisor-config :rabbitmq settings (or options {}))))
+
+;;; # User
+(defplan user
+  "Create the rabbitmq user"
+  [{:keys [instance-id] :as options}]
+  (let [{:keys [user owner group home]} (get-settings :rabbitmq options)]
+    (actions/group group :system true)
+    (when (not= owner user)
+      (actions/user owner :group group :system true))
+    (actions/user
+     user :group group :system true :create-home true :shell :bash)))
+
+;;; # Configuration
+(defplan config-file
+  "Helper to write config files"
+  [{:keys [owner group config-dir] :as settings} filename file-source]
+  (actions/directory config-dir :owner owner :group group)
+  (apply-map
+   actions/remote-file (fragment (file ~filename))
+   :flag-on-changed rabbitmq-config-changed-flag
+   :owner owner :group group
+   file-source))
 
 (defn- cluster-nodes
   "Create a node list for the specified nodes"
   [node-name nodes]
   (map
    (fn cluster-node-name [node]
-     (str node-name "@" (compute/hostname node)))
+     (str node-name "@" (node/hostname node)))
    nodes))
 
 (defn- cluster-nodes-for-group
   "Create a node list for the specified group"
-  [session group]
-  (let [nodes (session/nodes-in-group session group)]
-    (assert (seq nodes))
-    (cluster-nodes
-     (parameter/get-for
-      session
-      [:host (keyword (compute/id (first nodes))) :rabbitmq :options :node-name]
-      "rabbit")
-     nodes)))
+  [group]
+  nil)
+  ;; TODO: find a way to express it in 0.8 terms
+  ;; (let [nodes (crate/nodes-in-group group)]
+  ;;   (assert (seq nodes))
+  ;;   (cluster-nodes
+  ;;    (parameter/get-for
+  ;;     session
+  ;;     [:host (keyword (compute/id (first nodes))) :rabbitmq :options :node-name]
+  ;;     "rabbit")
+  ;;    nodes)))
 
 (defn- default-cluster-nodes
-  [session options]
+  [options]
   (cluster-nodes
    (:node-name options "rabbit")
-   (session/nodes-in-group session)))
+   (crate/nodes-in-group)))
 
-(defn- configure
-  "Write the configuration file, based on a hash map m, that is serialised as
-   erlang config.  By specifying :cluster group, the current group's rabbitmq
-   instances will be added as ram nodes to that cluster."
-  [session cluster config]
-  (let [options (parameter/get-for-target session [:rabbitmq :options] nil)
-        cluster-nodes (when cluster (cluster-nodes-for-group session cluster))
+(defn env-as-string [env]
+  (string/join "\n"
+               (map (fn [[k v]]
+                      (format "%s=%s" (name (get env-keys k)) v))
+                    (select-keys env (keys env-keys)))))
+
+(defplan configure
+  "Write all config files"
+  [{:keys [instance-id] :as options}]
+  (let [settings (get-settings :rabbitmq options)
+        cluster (:cluster settings)
+        cluster-nodes (when cluster (cluster-nodes-for-group cluster))
         cluster-nodes (or cluster-nodes
-                          (if-let [node-count (:node-count options)]
+                          (if-let [node-count (:node-count settings)]
                             (when (> node-count 1)
-                              (default-cluster-nodes session options))))]
-    (->
-     session
-     (etc-hosts/hosts-for-group (session/group-name session))
-     (when->
-      (or cluster-nodes config)
-      (remote-file/remote-file
-       (parameter/get-for-target session [:rabbitmq :config-file])
-       :content (erlang-config
-                 (if cluster-nodes
-                   (assoc-in config [:rabbit :cluster_nodes] cluster-nodes)
-                   config))
-       :literal true))
-     (when->
-      cluster
-      (etc-hosts/hosts-for-group cluster)))))
+                              (default-cluster-nodes settings))))
+        config (:config settings)
+        config-str (erlang-config/as-string
+                     (if cluster-nodes
+                       (assoc-in config [:rabbit :cluster_nodes] cluster-nodes)
+                       config))
+        env-str (env-as-string (:env settings))]
+    (debugf "configure %s %s" settings options)
+    (config-file settings (:env-file settings) {:content env-str})
+    (config-file settings (:config-file settings)
+                 {:content config-str})))
 
-(defn rabbitmq
-  "Install rabbitmq from packages.
-    :config map   - erlang configuration, specified as a map
-                    from application to attribute value map.
-    :cluster group  - If specified, then this group will be ram nodes for the
-                    given group's disk cluster."
-  [session & {:keys [node node-count mnesia-base log-base node-ip-address
-                     node-port config-file config cluster]
-              :as options}]
-  (->
-   session
-   (parameter/assoc-for-target
-    [:rabbitmq :options] options
-    [:rabbitmq :default-file] (or config-file "/etc/default/rabbitmq")
-    [:rabbitmq :conf-file] (or config-file "/etc/rabbitmq/rabbitmq.conf")
-    [:rabbitmq :config-file] (or config-file "/etc/rabbitmq/rabbitmq.config"))
-   (directory/directory
-    "/etc/rabbitmq")
-   (apply-map->
-    etc-default/write "rabbitmq"
-    (map #(vector (etc-default-keys (first %)) (second %))
-         (select-keys options (keys etc-default-keys))))
-   (apply-map->
-    etc-default/write "/etc/rabbitmq/rabbitmq.conf"
-    (map #(vector (conf-keys (first %)) (second %))
-         (select-keys options (keys conf-keys))))
-   (package/package "rabbitmq-server")
-   (configure cluster config)
-   (etc-hosts/hosts)))
+;;; # Install
+(defplan install
+  "Install rabbitmq."
+  [{:keys [instance-id]}]
+  (let [{:keys [install-strategy owner group log-dir] :as settings}
+        (get-settings :rabbitmq {:instance-id instance-id})]
+    (crate-install/install :rabbitmq instance-id)
+    (when log-dir
+      (actions/directory log-dir :owner owner :group group :mode "0755"))))
+
+;;; # Run
+(defplan service
+  "Run the rabbitmq service."
+  [& {:keys [action if-flag if-stopped instance-id]
+      :or {action :manage}
+      :as options}]
+  (let [{:keys [supervision-options] :as settings}
+        (get-settings :rabbitmq {:instance-id instance-id})]
+    (service/service settings (merge supervision-options
+                                     (dissoc options :instance-id)))))
+
+(defn server-spec
+  [settings & {:keys [instance-id] :as options}]
+  (api/server-spec
+   :phases
+   (merge {:settings (plan-fn (pallet.crate.rabbitmq/settings (merge settings options)))
+           :install (plan-fn
+                      (user options)
+                      (install options))
+           :configure (plan-fn
+                        (configure options)
+                        (apply-map service :action :enable options))
+           :run (plan-fn
+                  (apply-map service :action :start options))}
+          (service-phases :rabbitmq options service))))
+
 
 (defn iptables-accept
   "Accept rabbitmq connectios, by default on port 5672"
-  ([session] (iptables-accept session 5672))
-  ([session port]
-     (iptables/iptables-accept-port session port)))
+  ([] (iptables-accept 5672))
+  ([port]
+     (iptables/iptables-accept-port port)))
 
 (defn iptables-accept-status
   "Accept rabbitmq status connections, by default on port 55672"
-  ([session] (iptables-accept session 55672))
-  ([session port]
-     (iptables/iptables-accept-port session port)))
+  ([] (iptables-accept 55672))
+  ([port]
+     (iptables/iptables-accept-port port)))
 
 (defn password
   "Change rabbitmq password."
-  [session user password]
-  (->
-   session
-   (exec-script/exec-checked-script
+  [user password]
+  (do
+   (actions/exec-checked-script
     "Change RabbitMQ password"
-    (rabbitmqctl change_password ~user ~password))))
-
-;; rabbitmq without iptablse
-#_
-(pallet.core/defnode a {}
-  :bootstrap (pallet.phase/phase-fn
-              (pallet.crate.automated-admin-user/automated-admin-user))
-  :configure (pallet.phase/phase-fn
-              (pallet.crate.rabbitmq/rabbitmq))
-  :rabbitmq-restart (pallet.phase/phase-fn
-                     (pallet.action.service/service
-                      "rabbitmq-server" :action :restart)))
-
-;; cluster
-#_
-(pallet.core/defnode a {}
-  :bootstrap (pallet.phase/phase-fn
-              (pallet.crate.automated-admin-user/automated-admin-user))
-  :configure (pallet.phase/phase-fn
-              (pallet.crate.rabbitmq/rabbitmq))
-  :rabbitmq-restart (pallet.phase/phase-fn
-                     (pallet.action.service/service
-                      "rabbitmq-server" :action :restart)))
-
-#_
-(pallet.core/defnode ram-nodes {}
-  :bootstrap (pallet.phase/phase-fn
-              (pallet.crate.automated-admin-user/automated-admin-user))
-  :configure (pallet.phase/phase-fn
-              (pallet.crate.rabbitmq/rabbitmq))
-  :rabbitmq-restart (pallet.phase/phase-fn
-                     (pallet.action.service/service
-                      "rabbitmq-server" :action :restart)))
-
-;; rabbitmq with iptables
-#_
-(pallet.core/defnode a {}
-  :bootstrap (pallet.phase/phase-fn
-              (pallet.crate.automated-admin-user/automated-admin-user))
-  :configure (pallet.phase/phase-fn
-              (pallet.crate.iptables/iptables-accept-icmp)
-              (pallet.crate.iptables/iptables-accept-established)
-              (pallet.crate.ssh/iptables-throttle)
-              (pallet.crate.ssh/iptables-accept)
-              (pallet.crate.rabbitmq/rabbitmq :node-count 2)
-              (pallet.crate.rabbitmq/iptables-accept))
-  :rabbitmq-restart (pallet.phase/phase-fn
-                     (pallet.action.service/service
-                      "rabbitmq-server" :action :restart)))
+    ("rabbitmqctl" change_password ~user ~password))))
