@@ -78,7 +78,17 @@
   (cond
    (:install-strategy settings) settings
    :else  (assoc settings
-            :install-strategy ::packages
+            :install-strategy :packages
+            :packages ["rabbitmq-server"])))
+
+
+(defmethod-version-plan
+    settings-map {:os :linux}
+    [os os-version version settings]
+  (cond
+   (:install-strategy settings) settings
+   :else  (assoc settings
+            :install-strategy :packages
             :packages ["rabbitmq-server"])))
 
 
