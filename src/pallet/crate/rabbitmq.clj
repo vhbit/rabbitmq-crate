@@ -11,8 +11,8 @@
    [pallet.utils :refer [apply-map]]
    [clojure.string :as string]
    [pallet.crate.erlang-config :as erlang-config]
-   [pallet.stevedore :refer [fragment]]
-   [pallet.script.lib :refer [file config-root log-root]]
+   [pallet.stevedore :refer [fragment script]]
+   [pallet.script.lib :refer [file config-root log-root state-root]]
    [pallet.version-dispatch :refer [defmethod-version-plan
                                     defmulti-version-plan]]
    [pallet.crate.service :refer [supervisor-config supervisor-config-map] :as service]
@@ -37,6 +37,7 @@
    :env-file "/etc/rabbitmq/rabbitmq-env.conf"
    :config-dir (fragment (file (config-root) "rabbitmq"))
    :log-dir (fragment (file (log-root) "rabbitmq"))
+   :state-dir (fragment (file (state-root) "rabbitmq"))
    :supervisor :nohup
    :nohup {:process-name "rabbitmq-server"}
    :service-name (service-name options)
@@ -66,7 +67,7 @@
 (defn run-command
   "Return a script command to run rabbitmq."
   [{:keys [home user config-dir] :as settings}]
-  (fragment (file "rabbitmq-server")))
+  (script ("rabbitmq-server")))
 
 ;;; At the moment we just have a single implementation of settings,
 ;;; but this is open-coded.
@@ -81,25 +82,17 @@
             :install-strategy :packages
             :packages ["rabbitmq-server"])))
 
-
-(defmethod-version-plan
-    settings-map {:os :linux}
-    [os os-version version settings]
-  (cond
-   (:install-strategy settings) settings
-   :else  (assoc settings
-            :install-strategy :packages
-            :packages ["rabbitmq-server"])))
-
-
 (defmethod supervisor-config-map [:rabbitmq :runit]
   [_ {:keys [run-command service-name user] :as settings} options]
   {:service-name service-name
-   :run-file {:content (str "#!/bin/sh\nexec chpst " run-command)}})
+   :run-file {:content (str "#!/bin/sh\nexec chpst -u " user " " run-command)}})
 
 (defmethod supervisor-config-map [:rabbitmq :upstart]
-  [_ {:keys [run-command service-name user] :as settings} options]
+  [_ {:keys [run-command service-name user state-dir] :as settings} options]
   {:service-name service-name
+   :env (str "HOME=" state-dir)
+   :respawn true
+   ;:respawn-limit 10
    :exec run-command
    :setuid user})
 
@@ -234,7 +227,6 @@
            :run (plan-fn
                   (apply-map service :action :start options))}
           (service-phases :rabbitmq options service))))
-
 
 (defn iptables-accept
   "Accept rabbitmq connectios, by default on port 5672"

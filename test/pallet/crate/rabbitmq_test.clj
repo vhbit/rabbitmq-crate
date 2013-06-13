@@ -5,7 +5,8 @@
    [pallet.actions :as actions]
    [pallet.test-utils :as test-utils]
    [pallet.crate.erlang-config :as erlang-config]
-   [pallet.stevedore :as sd])
+   [pallet.stevedore :as sd]
+   [pallet.crate.rabbitmq :as rabbitmq])
   (:use clojure.test))
 
 (deftest erlang-config-test
@@ -19,12 +20,19 @@
 (deftest configure-test
   (let [node (test-utils/make-node "id" :ip "12.3.4.5")
         {:keys [owner group config-dir env-file]} (sd/with-script-language :pallet.stevedore.bash/bash
-                                                                           (default-settings {}))]
+                                                                           (rabbitmq/default-settings {}))]
     (testing "Default config"
       (is (build-actions/build-actions
            {}
-           (pallet.crate.rabbitmq/settings {:config-file "cf"})
-           (pallet.crate.rabbitmq/configure {:rabbit {}}))))))
+           (rabbitmq/settings {:config-file "cf"})
+           (rabbitmq/configure {:rabbit {}}))))
+    (testing "Starting service"
+      (is (build-actions/build-actions
+           {}
+           (rabbitmq/settings {})
+           (rabbitmq/install {})
+           (rabbitmq/configure {})
+           (rabbitmq/service))))))
 
 ;;     (testing "Default config"
 ;;       (is (= (first
@@ -39,8 +47,8 @@
 ;;              (first
 ;;               (build-actions/build-actions
 ;;                  {}
-;;                  (pallet.crate.rabbitmq/settings {:config-file "cf"})
-;;                  (pallet.crate.rabbitmq/configure {:rabbit {}}))))))
+;;                  (rabbitmq/settings {:config-file "cf"})
+;;                  (rabbitmq/configure {:rabbit {}}))))))
 ;;     ))
 ;;     (testing "Customized environment"
 ;;       (is (= (first
@@ -57,10 +65,10 @@
 ;;              (first
 ;;               (build-actions/build-actions
 ;;                  {}
-;;                  (pallet.crate.rabbitmq/settings {:config-file "cf"
+;;                  (rabbitmq/settings {:config-file "cf"
 ;;                                                   :env {:log-base "/opt/rabbitmq/log"
 ;;                                                         :mnesia-base "/opt/test/mnesia"}})
-;;                  (pallet.crate.rabbitmq/configure {:rabbit {}}))))))
+;;                  (rabbitmq/configure {:rabbit {}}))))))
 ;;     (testing "Default cluster"
 ;;       (is (= (first
 ;;               (build-actions/build-actions
@@ -74,9 +82,9 @@
 ;;              (first
 ;;               (build-actions/build-actions
 ;;                {}
-;;                (pallet.crate.rabbitmq/settings {:node-count 2
+;;                (rabbitmq/settings {:node-count 2
 ;;                                                 :config-file "cf"})
-;;                (pallet.crate.rabbitmq/configure {:rabbit {}}))))))))
+;;                (rabbitmq/configure {:rabbit {}}))))))))
 ;;   (testing "ram cluster"
 ;;       (is (=
 ;;            (first
@@ -95,12 +103,12 @@
 ;;                 :parameters {:host {:id-12-3-4-5
 ;;                                     {:rabbitmq {:config-file "cf"
 ;;                                                 :options {:node-count 2}}}}}}
-;; ;;               (pallet.crate.rabbitmq/configure :tag {:rabbit {}})))))))))
-;;                (pallet.crate.rabbitmq/settings (settings-map {:cluster :tag}))
-;;                (pallet.crate.rabbitmq/configure {:rabbit {}})))))))))
+;; ;;               (rabbitmq/configure :tag {:rabbit {}})))))))))
+;;                (rabbitmq/settings (settings-map {:cluster :tag}))
+;;                (rabbitmq/configure {:rabbit {}})))))))))
 
 (deftest invocation
   (is (build-actions/build-actions
        {:server
         {:node (test-utils/make-node "id" :private-ips ["12.3.4.5"])}}
-       (pallet.crate.rabbitmq/server-spec {:node-count 2}))))
+       (rabbitmq/server-spec {:node-count 2}))))
